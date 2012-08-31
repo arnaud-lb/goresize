@@ -19,6 +19,12 @@ import (
 	"syscall"
 	"time"
 	"crypto/tls"
+	"image"
+	"image/png"
+	_ "image/gif"
+	_ "image/jpeg"
+	"bytes"
+	"math"
 )
 
 // HTTP headers struct
@@ -42,6 +48,7 @@ var connection *redis.Client
 
 // Check if an URL is valid and not temporary in error
 func urlStatus(uri string) error {
+	return nil
 	ok, err := connection.Hexists("img/"+uri, "created_at").Bool()
 	if err != nil {
 		return err
@@ -185,14 +192,81 @@ func fetchImage(uri string) (headers Headers, body []byte, err error) {
 	if !ok {
 		headers, body, err = fetchImageFromServer(uri)
 	}
+
 	headers.cacheControl = "public, max-age=600"
 
 	return
 }
 
+func resizeImage(uri, origBody string, origHeaders Headers, width, height int) (headers Headers, body []byte, err error) {
+
+	m, _, err := image.Decode(strings.NewReader(origBody))
+
+	if err != nil {
+		return
+	}
+
+	bounds := m.Bounds()
+	origWidth, origHeight := bounds.Dx(), bounds.Dy()
+
+	if width >= origWidth && height >= origHeight {
+		headers = origHeaders
+		body = []byte(origBody)
+		return
+	}
+
+	ratio := math.Max(float64(origWidth), float64(origHeight)) / math.Min(float64(width), float64(height))
+
+	newWidth := int(math.Floor(float64(origWidth) / ratio))
+	newHeight := int(math.Floor(float64(origHeight) / ratio))
+
+	log.Printf("Resize: %s to %vx%v: orig: %vx%v; new: %vx%v; ratio: %v\n", uri, width, height, origWidth, origHeight, newWidth, newHeight, ratio)
+
+	m = Resize(m, m.Bounds(), newWidth, newHeight)
+	writter := new(bytes.Buffer)
+
+	err = png.Encode(writter, m)
+
+	if err != nil {
+		return
+	}
+
+	body = []byte(writter.String())
+
+	headers = origHeaders
+	headers.contentType = "image/png"
+
+	return
+}
+
+
 // Receive an HTTP request, fetch the image and respond with it
 func Image(w http.ResponseWriter, r *http.Request, fn func()) {
-	encoded_url := r.URL.Query().Get(":encoded_url")
+	query := r.URL.Query()
+	encoded_url := query.Get(":encoded_url")
+
+	strWidth, strHeight := query.Get(":width"), query.Get(":height")
+
+	width, err := strconv.ParseInt(strWidth, 10, 32)
+	if err != nil {
+		log.Printf("Invalid width %s\n", strWidth)
+		http.Error(w, "Invalid parameters", 400)
+		return
+	}
+
+	height, err := strconv.ParseInt(strHeight, 10, 32)
+	if err != nil {
+		log.Printf("Invalid width %s\n", strHeight)
+		http.Error(w, "Invalid parameters", 400)
+		return
+	}
+
+	if (width * height > maxSize) {
+		log.Printf("Requested resized image exceeds max size\n")
+		http.Error(w, "Requested resized image exceeds max size", 400)
+		return
+	}
+
 	chars, err := hex.DecodeString(encoded_url)
 	if err != nil {
 		log.Printf("Invalid URL %s\n", encoded_url)
@@ -210,6 +284,9 @@ func Image(w http.ResponseWriter, r *http.Request, fn func()) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
+
+	headers, body, err = resizeImage(uri, string(body), headers, int(width), int(height))
+
 	w.Header().Add("Content-Type", headers.contentType)
 	w.Header().Add("Last-Modified", headers.lastModified)
 	w.Header().Add("Cache-Control", headers.cacheControl)
@@ -220,15 +297,6 @@ func Image(w http.ResponseWriter, r *http.Request, fn func()) {
 func Img(w http.ResponseWriter, r *http.Request) {
 	fn := func() {
 		http.NotFound(w, r)
-	}
-	Image(w, r, fn)
-}
-
-// Receive an HTTP request for an avatar and respond with it
-func Avatar(w http.ResponseWriter, r *http.Request) {
-	fn := func() {
-		w.Header().Set("Location", defaultAvatarUrl)
-		w.WriteHeader(http.StatusFound)
 	}
 	Image(w, r, fn)
 }
@@ -273,10 +341,7 @@ func main() {
 	// Routing
 	m := pat.New()
 	m.Get("/status", http.HandlerFunc(Status))
-	m.Get("/img/:encoded_url/:filename", http.HandlerFunc(Img))
-	m.Get("/img/:encoded_url", http.HandlerFunc(Img))
-	m.Get("/avatars/:encoded_url/:filename", http.HandlerFunc(Avatar))
-	m.Get("/avatars/:encoded_url", http.HandlerFunc(Avatar))
+	m.Get("/resize/:encoded_url/:width/:height", http.HandlerFunc(Img))
 	http.Handle("/", m)
 
 	// Start the HTTP server
