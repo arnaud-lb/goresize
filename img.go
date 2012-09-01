@@ -48,14 +48,6 @@ var connection *redis.Client
 
 // Check if an URL is valid and not temporary in error
 func urlStatus(uri string) error {
-	return nil
-	ok, err := connection.Hexists("img/"+uri, "created_at").Bool()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return errors.New("Invalid URL")
-	}
 
 	str, err := connection.Get("img/err/" + uri).Str()
 	if err == nil {
@@ -76,10 +68,10 @@ func generateKeyForCache(s string) string {
 }
 
 // Fetch image from cache
-func fetchImageFromCache(uri string) (headers Headers, body []byte, ok bool) {
+func fetchImageFromCache(uri, variation string) (headers Headers, body []byte, ok bool) {
 	ok = false
 
-	contentType, err := connection.Hget("img/"+uri, "type").Str()
+	contentType, err := connection.Hget("img/"+variation+"/"+uri, "type").Str()
 	if err != nil {
 		return
 	}
@@ -96,18 +88,13 @@ func fetchImageFromCache(uri string) (headers Headers, body []byte, ok bool) {
 	body, err = ioutil.ReadFile(filename)
 	ok = err == nil
 
-	present, err := connection.Exists("img/updated/" + uri).Bool()
-	if err == nil && !present {
-		go fetchImageFromServer(uri)
-	}
-
 	return
 }
 
 // Save the body and the content-type header in cache
-func saveImageInCache(uri string, headers Headers, body []byte) {
+func saveImageInCache(uri, variation string, headers Headers, body []byte) {
 	go func() {
-		filename := generateKeyForCache(uri)
+		filename := generateKeyForCache(variation+":"+uri)
 		dirname := path.Dir(filename)
 		err := os.MkdirAll(dirname, 0755)
 		if err != nil {
@@ -122,9 +109,7 @@ func saveImageInCache(uri string, headers Headers, body []byte) {
 		}
 
 		// And other infos in redis
-		connection.Hset("img/"+uri, "type", headers.contentType)
-		connection.Set("img/updated/"+uri, headers.lastModified)
-		connection.Expire("img/updated/"+uri, 600)
+		connection.Hset("img/"+variation+"/"+uri, "type", headers.contentType)
 	}()
 }
 
@@ -176,7 +161,7 @@ func fetchImageFromServer(uri string) (headers Headers, body []byte, err error) 
 	headers.contentType = contentType
 	headers.lastModified = time.Now().Format(time.RFC1123)
 	if urlStatus(uri) == nil {
-		saveImageInCache(uri, headers, body)
+		saveImageInCache(uri, "orig", headers, body)
 	}
 	return
 }
@@ -188,12 +173,40 @@ func fetchImage(uri string) (headers Headers, body []byte, err error) {
 		return
 	}
 
-	headers, body, ok := fetchImageFromCache(uri)
+	headers, body, ok := fetchImageFromCache(uri, "orig")
 	if !ok {
 		headers, body, err = fetchImageFromServer(uri)
 	}
 
 	headers.cacheControl = "public, max-age=600"
+
+	return
+}
+
+func fetchResizedImage(uri string, width, height int) (headers Headers, body []byte, err error) {
+
+	variation := fmt.Sprintf("resize/%d/%d", width, height)
+	if err != nil {
+		return
+	}
+	
+	headers, body, ok := fetchImageFromCache(uri, variation)
+
+	if ok {
+		return
+	}
+
+	headers, body, err = fetchImage(uri)
+	if err != nil {
+		return
+	}
+
+	headers, body, err = resizeImage(uri, string(body), headers, width, height)
+	if (err != nil) {
+		return
+	}
+
+	saveImageInCache(uri, variation, headers, body)
 
 	return
 }
@@ -222,7 +235,7 @@ func resizeImage(uri, origBody string, origHeaders Headers, width, height int) (
 
 	log.Printf("Resize: %s to %vx%v: orig: %vx%v; new: %vx%v; ratio: %v\n", uri, width, height, origWidth, origHeight, newWidth, newHeight, ratio)
 
-	m = Resize(m, m.Bounds(), newWidth, newHeight)
+	m = Resample(m, m.Bounds(), newWidth, newHeight)
 	writter := new(bytes.Buffer)
 
 	err = png.Encode(writter, m)
@@ -275,17 +288,16 @@ func Image(w http.ResponseWriter, r *http.Request, fn func()) {
 	}
 	uri := string(chars)
 
-	headers, body, err := fetchImage(uri)
+	headers, body, err := fetchResizedImage(uri, int(width), int(height))
 	if err != nil {
 		fn()
 		return
 	}
+
 	if headers.lastModified == r.Header.Get("If-Modified-Since") {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-
-	headers, body, err = resizeImage(uri, string(body), headers, int(width), int(height))
 
 	w.Header().Add("Content-Type", headers.contentType)
 	w.Header().Add("Last-Modified", headers.lastModified)
