@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/bmizerany/pat"
-	"github.com/fzzbt/radix/redis"
+	"github.com/fzzy/radix/redis"
 	"io"
 	"io/ioutil"
 	"log"
